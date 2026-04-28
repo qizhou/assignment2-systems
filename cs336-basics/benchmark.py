@@ -10,10 +10,17 @@ batch_size = 4
 context_length = 256
 w = 5 # warmup step
 m = 10 # number of measurement
+forward_only = True
+memory_profile = True
+torch.set_grad_enabled(not forward_only)
+
+if memory_profile:
+    torch.cuda.memory._record_memory_history(max_entries=1000000)
 
 torch.set_default_device("cuda")
 model = BasicsTransformerLM(vocab_size, context_length, d_model, num_layers, num_heads, d_ff)
-dtype = torch.bfloat16
+dtype = torch.float32
+
 
 forward_used_time = []
 backward_used_time = []
@@ -31,6 +38,9 @@ with torch.autocast(device_type="cuda", dtype=dtype):
         if i >= w:
             forward_used_time.append(timeit.default_timer() - start)
 
+        if forward_only:
+            continue
+
         # backward
         start = timeit.default_timer()
         loss = cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
@@ -41,3 +51,7 @@ with torch.autocast(device_type="cuda", dtype=dtype):
 
     print(torch.mean(torch.tensor(forward_used_time)), torch.std(torch.tensor(forward_used_time)))
     print(torch.mean(torch.tensor(backward_used_time)), torch.std(torch.tensor(backward_used_time)))
+
+if memory_profile:
+    torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+    torch.cuda.memory._record_memory_history(enabled=None)
