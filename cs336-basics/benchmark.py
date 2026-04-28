@@ -26,6 +26,7 @@ for i in range(w+m):
     # forward
     start = timeit.default_timer()
     logits = model(inputs)
+    torch.cuda.synchronize()
     if i >= w:
         forward_used_time.append(timeit.default_timer() - start)
 
@@ -33,6 +34,7 @@ for i in range(w+m):
     start = timeit.default_timer()
     loss = cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
     loss.backward()
+    torch.cuda.synchronize()
     if i >= w:
         backward_used_time.append(timeit.default_timer() - start)
 
