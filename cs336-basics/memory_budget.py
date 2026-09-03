@@ -27,4 +27,3 @@ print(f"inference: act_embedding {act_embedding:,}, act_attn {act_attn:,}, act_f
 # for training stage, we need to store all activations from all layers and all batches to calculate gradient
 print(f"training: act_embedding {act_embedding*batch:,}, act_attn {act_attn*num_layers*batch:,}, act_feed_forward {act_feed_forward*num_layers*batch:,} , total {batch*(act_embedding+(act_attn+act_feed_forward)*num_layers):,}")
 
-
