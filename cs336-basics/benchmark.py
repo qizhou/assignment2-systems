@@ -20,6 +20,8 @@ if memory_profile:
 torch.set_default_device("cuda")
 model = BasicsTransformerLM(vocab_size, context_length, d_model, num_layers, num_heads, d_ff)
 dtype = torch.float32
+torch.set_float32_matmul_precision('high')
+model.compile()
 
 
 forward_used_time = []
@@ -49,8 +51,9 @@ with torch.autocast(device_type="cuda", dtype=dtype):
         if i >= w:
             backward_used_time.append(timeit.default_timer() - start)
 
-    print(torch.mean(torch.tensor(forward_used_time)), torch.std(torch.tensor(forward_used_time)))
-    print(torch.mean(torch.tensor(backward_used_time)), torch.std(torch.tensor(backward_used_time)))
+    print(torch.mean(torch.tensor(forward_used_time)).item(), torch.std(torch.tensor(forward_used_time)).item())
+    if not forward_only:
+        print(torch.mean(torch.tensor(backward_used_time)), torch.std(torch.tensor(backward_used_time)))
 
 if memory_profile:
     torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
