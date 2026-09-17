@@ -55,8 +55,8 @@ def weighted_sum_fwd(
     )
 
     # Initialize a buffer to write to
-    output = tl.zeros((ROWS_TILE_SIZE,), dtype=tl.float32)
-    for i in range(tl.cdiv(D, D_TILE_SIZE)):
+    output = tl.zeros((ROWS_TILE_SIZE,), dtype=tl.float32) # (16)
+    for i in range(tl.cdiv(D, D_TILE_SIZE)): # 32 // 2 => 16 loops
         # Load the current block pointer
         # Since ROWS_TILE_SIZE might not divide NUM_ROWS, and D_TILE_SIZE might not divide D,
         # we need boundary checks for both dimensions
@@ -172,6 +172,9 @@ class WeightedSumFunc(torch.autograd.Function):
 
         # Launch our kernel with n instances in our 1D grid.
         n_rows = y.numel()
+        # print(n_rows, D, "ROWS_TILE_SIZE", ctx.ROWS_TILE_SIZE, "D_TILE_SIZE", ctx.D_TILE_SIZE)
+        # print(x.stride(0), x.stride(1))
+        # print(weight.stride(0))
         weighted_sum_fwd[(triton.cdiv(n_rows, ctx.ROWS_TILE_SIZE),)](
             x, weight,
             y,
@@ -230,8 +233,8 @@ if __name__ == "__main__":
     print(v, ev, dv)
 
     f_weightedsum = WeightedSumFunc.apply
-    x = torch.randn((16, 32), device="cuda", requires_grad=True)
-    w = torch.randn((32), device="cuda", requires_grad=True)
+    x = torch.randn((32, 64), device="cuda", requires_grad=True)
+    w = torch.randn((64), device="cuda", requires_grad=True)
     y = f_weightedsum(x, w)
     print(y.shape, y)
     e = y.backward(torch.ones_like((y)))
