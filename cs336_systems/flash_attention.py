@@ -75,9 +75,30 @@ def flash_attention_simplified(Q, K, V):
                 O[i][k] = O[i][k] * l_old * math.exp(m_old - m[i]) / l[i] + math.exp(s - m[i]) / l[i] * V[j][k]
     return O
 
+def flash_attention2_simplified(Q, K, V):
+    O = [[0 for _ in range(d_model)] for _ in range(seq_len)]
+
+    for i in range(seq_len): # query i
+        m = -math.inf
+        l = 0
+        for j in range(seq_len): # key j
+            # Evaluate query i, key j
+            s = sum([Q[i][k] * K[j][k] for k in range(d_model)])
+            m_old = m
+            m = max(m, s)
+            l_old = l
+            l = l * math.exp(m_old - m) + math.exp(s - m)
+
+            for k in range(d_model):
+                O[i][k] = O[i][k] * l_old * math.exp(m_old - m) / l + math.exp(s - m) / l * V[j][k]
+    return O
+
 
 O_standard = standard_attention(Q, K, V)
 O_flash = flash_attention_simplified(Q, K, V)
+O_flash2 = flash_attention2_simplified(Q, K, V)
 
 diff = sum([sum([math.fabs(O_standard[i][j] - O_flash[i][j]) for j in range(d_model)]) for i in range(seq_len)])
-print(diff)
+diff2 = sum([sum([math.fabs(O_standard[i][j] - O_flash2[i][j]) for j in range(d_model)]) for i in range(seq_len)])
+
+print(diff, diff2)
