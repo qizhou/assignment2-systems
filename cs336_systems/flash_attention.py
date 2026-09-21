@@ -86,11 +86,14 @@ def flash_attention2_simplified(Q, K, V):
             s = sum([Q[i][k] * K[j][k] for k in range(d_model)])
             m_old = m
             m = max(m, s)
-            l_old = l
             l = l * math.exp(m_old - m) + math.exp(s - m)
 
             for k in range(d_model):
-                O[i][k] = O[i][k] * l_old * math.exp(m_old - m) / l + math.exp(s - m) / l * V[j][k]
+                O[i][k] = O[i][k] * math.exp(m_old - m) + math.exp(s - m) * V[j][k]
+
+        for k in range(d_model):
+            O[i][k] = O[i][k]  / l
+
     return O
 
 

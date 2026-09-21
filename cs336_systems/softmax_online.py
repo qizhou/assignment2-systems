@@ -22,7 +22,7 @@ def softmax_online(S):
         m = max(m, s)
         l_old = l
         l = l * math.exp(m_old - m) + math.exp(s - m)
-        # renoramalize
+        # renormalize
         for i in range(len(P)):
             P[i] = P[i] * l_old * math.exp(m_old - m) / l
 
@@ -34,7 +34,7 @@ def softmax_online(S):
 def softmaxV_online(S, V):
     m = -math.inf
     l = 0
-    SV = [0 for _ in range(d_model)]
+    O = [0 for _ in range(d_model)]
     for i, s in enumerate(S):
         m_old = m
         m = max(m, s)
@@ -43,9 +43,28 @@ def softmaxV_online(S, V):
 
         for j in range(d_model):
             # renormalized value + new value
-            SV[j] = SV[j] * l_old * math.exp(m_old - m) / l + math.exp(s - m) / l * V[i][j]
+            O[j] = O[j] * l_old * math.exp(m_old - m) / l + math.exp(s - m) / l * V[i][j]
 
-    return SV
+    return O
+
+
+def softmaxV2_online(S, V):
+    m = -math.inf
+    l = 0
+    O = [0 for _ in range(d_model)]
+    for i, s in enumerate(S):
+        m_old = m
+        m = max(m, s)
+        l = l * math.exp(m_old - m) + math.exp(s - m)
+
+        for j in range(d_model):
+            # renormalized value + new value
+            O[j] = O[j] * math.exp(m_old - m) + math.exp(s - m) * V[i][j]
+
+    for j in range(d_model):
+        O[j] = O[j] / l
+
+    return O
 
 
 S = [random.normalvariate() for _ in range(N)]
@@ -61,5 +80,8 @@ for i in range(d_model):
     SV.append(sum([P_stable[j] * V[j][i] for j in range(N)]))
 
 SV_online = softmaxV_online(S, V)
+SV2_online = softmaxV2_online(S, V)
 diff = sum([math.fabs(SV[i] - SV_online[i]) for i in range(d_model)])
-print(diff)
+diff2 = sum([math.fabs(SV[i] - SV2_online[i]) for i in range(d_model)])
+
+print(diff, diff2)
