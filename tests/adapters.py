@@ -1,8 +1,70 @@
 from __future__ import annotations
 
+import math
 import torch
 
+from einops import einsum
 
+
+def flash_attention_single_batch(Q, K, V):
+    N_q, d_model = Q.shape
+    N_k, _ = K.shape
+
+    # block sizes
+    B_q = 16
+    B_k = 16
+
+    T_q = N_q // B_q
+    T_k = N_k // B_k
+
+    O = torch.zeros((N_q, d_model))
+    L = torch.zeros((N_q,))
+
+    for i in range(T_q):
+        # load Qi from global memory
+        Qi = Q[i*B_q:(i+1)*B_q]
+        Oi = torch.zeros((B_q, d_model))
+        li = torch.zeros((B_q,))
+        mi = torch.full((B_q,), -torch.inf)
+
+        for j in range(T_k):
+            # load Kj, Vj from global memory
+            Kj = K[j*B_k:(j+1)*B_k] # shape (B_k, d_model)
+            Vj = V[j*B_k:(j+1)*B_k] # shape (B_k, d_model)
+
+            Sij = einsum(Qi, Kj, "B_q d_model, B_k d_model -> B_q B_k") / math.sqrt(d_model) # shape (B_q, B_k)
+
+            mi_new = torch.stack((mi, Sij.max(dim=-1).values)).max(dim=0).values # shape (B_q)
+            P = (Sij - mi_new.reshape((B_q, 1)).expand(B_q, B_k)).exp() # shape (B_q, B_k)
+
+            li_new = (mi - mi_new).exp() * li + P.sum(dim=-1) # shape (B_q)
+
+            Oi = (mi - mi_new).exp().diag() @ Oi + P @ Vj # shape (B_q, d_model)
+
+            mi = mi_new
+            li = li_new
+
+        O[i*B_q:(i+1)*B_q] = (1 / li).diag() @ Oi
+        L[i*B_q:(i+1)*B_q] = mi + li.log()
+
+    return O, L
+
+
+class FlashAttentionFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, Q, K, V, is_causal=False):
+        batch, N_q, d_model = Q.shape
+
+        O = torch.zeros((batch, N_q, d_model))
+        L = torch.zeros((batch, N_q))
+
+        for b in range(batch):
+            Ob, Lb = flash_attention_single_batch(Q[b], K[b], V[b])
+            O[b] = Ob
+            L[b] = Lb
+
+        ctx.save_for_backward(L)
+        return O
 
 def get_flashattention_autograd_function_pytorch() -> type:
     """
@@ -14,7 +76,7 @@ def get_flashattention_autograd_function_pytorch() -> type:
         A class object (not an instance of the class)
     """
     # For example: return MyFlashAttnAutogradFunctionClass
-    raise NotImplementedError
+    return FlashAttentionFunc
 
 
 def get_flashattention_autograd_function_triton() -> type:
