@@ -50,6 +50,23 @@ def flash_attention_single_batch(Q, K, V):
     return O, L
 
 
+def attention_backward(Q, K, V, O, dO, L, is_causal=False):
+    # Q shape (B, N_q, d_model)
+    # K, V shape (B, N_k, d_model)
+    # dO shape (B, N_q, d_model)
+    B, N_q, d_model = Q.shape
+    _, N_k, _ = K.shape
+    S = einsum(Q, K, "... N_q d_model, ... N_k d_model -> ... N_q N_k") / math.sqrt(d_model) # shape (B, N_q, N_k)
+    P = (S - L.reshape(B, N_q, 1).expand(B, N_q, N_k)).exp() # shape (B, N_q, N_k)
+    dV = einsum(P.transpose(1, 2), dO.transpose(1, 2), "... N_k N_q, ... d_model N_q -> ... N_k d_model") # shape (B, N_k, d_model)
+    dP = einsum(dO, V, "... N_q d_model, ... N_k d_model -> ... N_q N_k") # shape (B, N_q, N_k)
+    D = (O * dO).sum(-1) # shape (B, N_q)
+    dS = P * (dP - D.reshape(B, N_q, 1).expand(B, N_q, N_k)) # shape (B, N_q, N_k)
+    dQ = einsum(dS, K.transpose(1, 2), "... N_q N_k, ... d_model N_k -> ... N_q d_model") / math.sqrt(d_model) # shape (B, N_q, d_model)
+    dK = einsum(dS.transpose(1, 2), Q.transpose(1, 2), "... N_k N_q, ... d_model N_q -> ... N_k d_model") / math.sqrt(d_model) # shape (B, N_k, d_model)
+    return dQ, dK, dV
+
+
 class FlashAttentionFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
@@ -63,8 +80,18 @@ class FlashAttentionFunc(torch.autograd.Function):
             O[b] = Ob
             L[b] = Lb
 
-        ctx.save_for_backward(L)
+        ctx.save_for_backward(Q, K, V, O, L)
         return O
+
+    @staticmethod
+    def backward(ctx, dO, is_causal=False):
+        # Q shape (B, N_q, d_model)
+        # K, V shape (B, N_k, d_model)
+        # dO shape (B, N_q, d_model)
+        Q, K, V, O, L = ctx.saved_tensors
+        dQ, dK, dV = attention_backward(Q, K, V, O, dO, L)
+        return dQ, dK, dV, None
+
 
 def get_flashattention_autograd_function_pytorch() -> type:
     """
