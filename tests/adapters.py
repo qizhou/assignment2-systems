@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 import torch
+import triton
+import triton.language as tl
 
 from einops import einsum
 
@@ -35,16 +37,21 @@ def flash_attention_single_batch(Q, K, V):
             Sij = einsum(Qi, Kj, "B_q d_model, B_k d_model -> B_q B_k") / math.sqrt(d_model) # shape (B_q, B_k)
 
             mi_new = torch.stack((mi, Sij.max(dim=-1).values)).max(dim=0).values # shape (B_q)
-            P = (Sij - mi_new.reshape((B_q, 1)).expand(B_q, B_k)).exp() # shape (B_q, B_k)
+            # P = (Sij - mi_new.reshape((B_q, 1)).expand(B_q, B_k)).exp() # shape (B_q, B_k)
+            P = (Sij - mi_new.reshape((B_q, 1))).exp() # shape (B_q, B_k)
 
-            li_new = (mi - mi_new).exp() * li + P.sum(dim=-1) # shape (B_q)
+            alpha = (mi - mi_new).exp() # shape (B_q)
 
-            Oi = (mi - mi_new).exp().diag() @ Oi + P @ Vj # shape (B_q, d_model)
+            li_new = alpha * li + P.sum(dim=-1) # shape (B_q)
+
+            # Oi = (mi - mi_new).exp().diag() @ Oi + P @ Vj # shape (B_q, d_model)
+            Oi = alpha.reshape((B_q, 1)) * Oi + P @ Vj # shape (B_q, d_model)
 
             mi = mi_new
             li = li_new
 
-        O[i*B_q:(i+1)*B_q] = (1 / li).diag() @ Oi
+        # O[i*B_q:(i+1)*B_q] = (1 / li).diag() @ Oi
+        O[i*B_q:(i+1)*B_q] = (1 / li).reshape((B_q, 1)) * Oi
         L[i*B_q:(i+1)*B_q] = mi + li.log()
 
     return O, L
@@ -57,14 +64,117 @@ def attention_backward(Q, K, V, O, dO, L, is_causal=False):
     B, N_q, d_model = Q.shape
     _, N_k, _ = K.shape
     S = einsum(Q, K, "... N_q d_model, ... N_k d_model -> ... N_q N_k") / math.sqrt(d_model) # shape (B, N_q, N_k)
-    P = (S - L.reshape(B, N_q, 1).expand(B, N_q, N_k)).exp() # shape (B, N_q, N_k)
+    # P = (S - L.reshape(B, N_q, 1).expand(B, N_q, N_k)).exp() # shape (B, N_q, N_k)
+    P = (S - L.reshape(B, N_q, 1)).exp() # shape (B, N_q, N_k)
     dV = einsum(P.transpose(1, 2), dO.transpose(1, 2), "... N_k N_q, ... d_model N_q -> ... N_k d_model") # shape (B, N_k, d_model)
     dP = einsum(dO, V, "... N_q d_model, ... N_k d_model -> ... N_q N_k") # shape (B, N_q, N_k)
     D = (O * dO).sum(-1) # shape (B, N_q)
-    dS = P * (dP - D.reshape(B, N_q, 1).expand(B, N_q, N_k)) # shape (B, N_q, N_k)
+    # dS = P * (dP - D.reshape(B, N_q, 1).expand(B, N_q, N_k)) # shape (B, N_q, N_k)
+    dS = P * (dP - D.reshape(B, N_q, 1)) # shape (B, N_q, N_k)
     dQ = einsum(dS, K.transpose(1, 2), "... N_q N_k, ... d_model N_k -> ... N_q d_model") / math.sqrt(d_model) # shape (B, N_q, d_model)
     dK = einsum(dS.transpose(1, 2), Q.transpose(1, 2), "... N_k N_q, ... d_model N_q -> ... N_k d_model") / math.sqrt(d_model) # shape (B, N_k, d_model)
     return dQ, dK, dV
+
+
+@triton.jit
+def flash_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr,
+    O_ptr, L_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_ob, stride_oq, stride_od,
+    stride_lb, stride_lq,
+    N_QUERIES, N_KEYS,
+    scale,
+    D: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+):
+    # Program indices
+    query_tile_index = tl.program_id(0)
+    batch_index = tl.program_id(1)
+
+    # Offset each pointer with the corresponding batch index
+    # multiplied with the batch stride for each tensor
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_index * stride_qb,
+        shape=(N_QUERIES, D),
+        strides=(stride_qq, stride_qd),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    O_block_ptr = tl.make_block_ptr(
+        O_ptr + batch_index * stride_ob,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_index * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(query_tile_index * Q_TILE_SIZE,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+
+    # will loop over tiled K, V
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_index * stride_kb,
+        shape=(N_KEYS, D),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_index * stride_vb,
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    Qi = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero") # shape B_q, D
+    Oi = tl.zeros((Q_TILE_SIZE, D), tl.float32)
+    li = tl.zeros((Q_TILE_SIZE,), tl.float32)
+    mi = tl.full((Q_TILE_SIZE,), -float("inf"), tl.float32)
+
+    for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+        Kj = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero") # shape B_k, D
+        Vj = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero") # shape B_k, D
+
+        Sij = tl.dot(Qi, tl.trans(Kj)) * scale # shape B_q, B_k
+
+        mi_new = tl.maximum(mi, tl.max(Sij, axis=1))
+
+        P = tl.exp(Sij - mi_new[:, None]) # mij[:, None] or mij.expand_dims(1) shape [B_q, 1], P shape B_q, B_k
+
+        alpha = tl.exp(mi - mi_new) # shape B_q
+        li_new = alpha * li + tl.sum(P, axis=1) # shape B_q
+
+        P_casted = P.to(Vj.dtype)
+        Oi_new = alpha[:, None] * Oi + tl.dot(P_casted, Vj) # shape B_q, D
+
+        # Move to next block
+        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+        mi = mi_new
+        li = li_new
+        Oi = Oi_new
+
+    Oi = (1 / li)[:, None] * Oi
+    # Write to O
+    tl.store(O_block_ptr, Oi.to(O_block_ptr.type.element_ty), boundary_check=(0, 1))
+
+    Li = mi + tl.log(li)
+    # Write to L
+    tl.store(L_block_ptr, Li.to(L_block_ptr.type.element_ty), boundary_check=(0,))
 
 
 class FlashAttentionFunc(torch.autograd.Function):
@@ -93,6 +203,37 @@ class FlashAttentionFunc(torch.autograd.Function):
         return dQ, dK, dV, None
 
 
+class FlashAttentionTritonFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, Q, K, V, is_causal=False):
+        batch, N_q, d_model = Q.shape
+        _, N_k, _ = K.shape
+
+        ctx.Q_TILE_SIZE = 16
+        ctx.K_TILE_SIZE = 16
+
+        O = torch.zeros((batch, N_q, d_model), device="cuda")
+        L = torch.zeros((batch, N_q), device="cuda")
+
+        flash_fwd_kernel[(triton.cdiv(N_q, ctx.Q_TILE_SIZE), batch)](
+            Q, K, V,
+            O, L,
+            Q.stride(0), Q.stride(1), Q.stride(2),
+            K.stride(0), K.stride(1), K.stride(2),
+            V.stride(0), V.stride(1), V.stride(2),
+            O.stride(0), O.stride(1), O.stride(2),
+            L.stride(0), L.stride(1),
+            N_q, N_k,
+            1 / math.sqrt(d_model),
+            d_model,
+            ctx.Q_TILE_SIZE,
+            ctx.K_TILE_SIZE,
+        )
+
+        ctx.save_for_backward(Q, K, V, O, L)
+        return O
+
+
 def get_flashattention_autograd_function_pytorch() -> type:
     """
     Returns a torch.autograd.Function subclass that implements FlashAttention2.
@@ -119,7 +260,7 @@ def get_flashattention_autograd_function_triton() -> type:
         A class object (not an instance of the class)
     """
     # For example: return MyTritonFlashAttentionAutogradFunctionClass
-    raise NotImplementedError
+    return FlashAttentionTritonFunc
 
 
 def get_ddp(module: torch.nn.Module) -> torch.nn.Module:
