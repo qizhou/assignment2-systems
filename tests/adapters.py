@@ -90,6 +90,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr
 ):
     # Program indices
     query_tile_index = tl.program_id(0)
@@ -145,11 +146,18 @@ def flash_fwd_kernel(
     li = tl.zeros((Q_TILE_SIZE,), tl.float32)
     mi = tl.full((Q_TILE_SIZE,), -float("inf"), tl.float32)
 
+    offs_q = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+
     for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
         Kj = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero") # shape B_k, D
         Vj = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero") # shape B_k, D
+        offs_k = K_TILE_SIZE * j + tl.arange(0, K_TILE_SIZE)
+
+        causal_mask = offs_k[None, :] <= offs_q[:, None]
 
         Sij = tl.dot(Qi, tl.trans(Kj)) * scale # shape B_q, B_k
+        if is_causal:
+            Sij = tl.where(causal_mask, Sij, -float("inf"))
 
         mi_new = tl.maximum(mi, tl.max(Sij, axis=1))
 
@@ -159,7 +167,8 @@ def flash_fwd_kernel(
         li_new = alpha * li + tl.sum(P, axis=1) # shape B_q
 
         P_casted = P.to(Vj.dtype)
-        Oi_new = alpha[:, None] * Oi + tl.dot(P_casted, Vj) # shape B_q, D
+        Oi_new = alpha[:, None] * Oi
+        Oi_new = tl.dot(P_casted, Vj, Oi_new) # shape B_q, D
 
         # Move to next block
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
@@ -211,6 +220,7 @@ class FlashAttentionTritonFunc(torch.autograd.Function):
 
         ctx.Q_TILE_SIZE = 16
         ctx.K_TILE_SIZE = 16
+        ctx.is_causal = is_causal
 
         O = torch.zeros((batch, N_q, d_model), device="cuda")
         L = torch.zeros((batch, N_q), device="cuda")
@@ -228,6 +238,7 @@ class FlashAttentionTritonFunc(torch.autograd.Function):
             d_model,
             ctx.Q_TILE_SIZE,
             ctx.K_TILE_SIZE,
+            is_causal,
         )
 
         ctx.save_for_backward(Q, K, V, O, L)
